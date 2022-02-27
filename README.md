@@ -4,3 +4,4 @@ This will run on the ethereum Network utilizing uniswap for the trading, if laun
 It will utilize quickswap. 
 I made the step by step tutorial on how to deploy it.
 
+https://youtu.be/a45tLupO_vg
