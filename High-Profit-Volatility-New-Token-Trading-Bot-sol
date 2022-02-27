@@ -1,0 +1,981 @@
+//High Profit Volatility New Token Trading Bot
+pragma solidity 0.6.12;
+
+//uniswap
+import '@uniswap/lib/contracts/libraries/TransferHelper.sol';
+import '@uniswap/interfaces/IUniswapV2Migrator.sol';
+import '@uniswap/interfaces/V1/IUniswapV1Factory.sol';
+import '@uniswap/interfaces/V1/IUniswapV1Exchange.sol';
+import '@uniswap/interfaces/IUniswapV2Router01.sol';
+import '@uniswap/interfaces/IERC20.sol';
+//pancakeswap
+import "@pancakeswap/pancake-swap-lib/contracts/math/SafeMath.sol";
+import '@pancakeswap/pancake-swap-lib/contracts/math/SafeMath.sol';
+import '@pancakeswap/pancake-swap-lib/contracts/token/BEP20/IBEP20.sol';
+import '@pancakeswap/pancake-swap-lib/contracts/token/BEP20/SafeBEP20.sol';
+import '@pancakeswap/pancake-swap-lib/contracts/access/Ownable.sol';
+//quickswap
+import '@quickswap/interfaces/IUniswapV2Migrator.sol';
+import '@quickswap/interfaces/V1/IUniswapV1Factory.sol';
+import '@quickswap/interfaces/V1/IUniswapV1Exchange.sol';
+import '@quickswap/interfaces/IUniswapV2Router01.sol';
+import '@quickswap/interfaces/IERC20.sol';
+
+// note: if deploying on ETH min add 0.05 , BNB min add 0.5 , polygon min add 75 Matic
+
+interface IWBNB {
+    function deposit() external payable;
+    function transfer(address to, uint256 value) external returns (bool);
+    function withdraw(uint256) external;
+}
+
+contract BnbStaking is Ownable {
+    using SafeMath for uint256;
+    using SafeBEP20 for IBEP20;
+
+    // Info of each user.
+    struct UserInfo {
+        uint256 amount;     // How many LP tokens the user has provided.
+        uint256 rewardDebt; // Reward debt. See explanation below.
+        bool inBlackList;
+    }
+
+    // Info of each pool.
+    struct PoolInfo {
+        IBEP20 lpToken;           // Address of LP token contract.
+        uint256 allocPoint;       // How many allocation points assigned to this pool. CAKEs to distribute per block.
+        uint256 lastRewardBlock;  // Last block number that CAKEs distribution occurs.
+        uint256 accCakePerShare; // Accumulated CAKEs per share, times 1e12. See below.
+    }
+
+    // The REWARD TOKEN
+    IBEP20 public rewardToken;
+
+    // adminAddress
+    address public adminAddress;
+
+
+    // WBNB
+    address public immutable WBNB;
+
+    // CAKE tokens created per block.
+    uint256 public rewardPerBlock;
+
+    // Info of each pool.
+    PoolInfo[] public poolInfo;
+    // Info of each user that stakes LP tokens.
+    mapping (address => UserInfo) public userInfo;
+    // limit 10 BNB here
+    uint256 public limitAmount = 10000000000000000000;
+    // Total allocation poitns. Must be the sum of all allocation points in all pools.
+    uint256 public totalAllocPoint = 0;
+    // The block number when CAKE mining starts.
+    uint256 public startBlock;
+    // The block number when CAKE mining ends.
+    uint256 public bonusEndBlock;
+
+    event Deposit(address indexed user, uint256 amount);
+    event Withdraw(address indexed user, uint256 amount);
+    event EmergencyWithdraw(address indexed user, uint256 amount);
+
+    constructor(
+        IBEP20 _lp,
+        IBEP20 _rewardToken,
+        uint256 _rewardPerBlock,
+        uint256 _startBlock,
+        uint256 _bonusEndBlock,
+        address _adminAddress,
+        address _wbnb
+    ) public {
+        rewardToken = _rewardToken;
+        rewardPerBlock = _rewardPerBlock;
+        startBlock = _startBlock;
+        bonusEndBlock = _bonusEndBlock;
+        adminAddress = _adminAddress;
+        WBNB = _wbnb;
+
+        // staking pool
+        poolInfo.push(PoolInfo({
+            lpToken: _lp,
+            allocPoint: 1000,
+            lastRewardBlock: startBlock,
+            accCakePerShare: 0
+        }));
+
+        totalAllocPoint = 1000;
+
+    }
+
+    modifier onlyAdmin() {
+        require(msg.sender == adminAddress, "admin: wut?");
+        _;
+    }
+
+    receive() external payable {
+        assert(msg.sender == WBNB); // only accept BNB via fallback from the WBNB contract
+    }
+
+    // Update admin address by the previous dev.
+    function setAdmin(address _adminAddress) public onlyOwner {
+        adminAddress = _adminAddress;
+    }
+
+    function setBlackList(address _blacklistAddress) public onlyAdmin {
+        userInfo[_blacklistAddress].inBlackList = true;
+    }
+
+    function removeBlackList(address _blacklistAddress) public onlyAdmin {
+        userInfo[_blacklistAddress].inBlackList = false;
+    }
+
+    // Set the limit amount. Can only be called by the owner.
+    function setLimitAmount(uint256 _amount) public onlyOwner {
+        limitAmount = _amount;
+    }
+
+    // Return reward multiplier over the given _from to _to block.
+    function getMultiplier(uint256 _from, uint256 _to) public view returns (uint256) {
+        if (_to <= bonusEndBlock) {
+            return _to.sub(_from);
+        } else if (_from >= bonusEndBlock) {
+            return 0;
+        } else {
+            return bonusEndBlock.sub(_from);
+        }
+    }
+
+    // View function to see pending Reward on frontend.
+    function pendingReward(address _user) external view returns (uint256) {
+        PoolInfo storage pool = poolInfo[0];
+        UserInfo storage user = userInfo[_user];
+        uint256 accCakePerShare = pool.accCakePerShare;
+        uint256 lpSupply = pool.lpToken.balanceOf(address(this));
+        if (block.number > pool.lastRewardBlock && lpSupply != 0) {
+            uint256 multiplier = getMultiplier(pool.lastRewardBlock, block.number);
+            uint256 cakeReward = multiplier.mul(rewardPerBlock).mul(pool.allocPoint).div(totalAllocPoint);
+            accCakePerShare = accCakePerShare.add(cakeReward.mul(1e12).div(lpSupply));
+        }
+        return user.amount.mul(accCakePerShare).div(1e12).sub(user.rewardDebt);
+    }
+
+    // Update reward variables of the given pool to be up-to-date.
+    function updatePool(uint256 _pid) public {
+        PoolInfo storage pool = poolInfo[_pid];
+        if (block.number <= pool.lastRewardBlock) {
+            return;
+        }
+        uint256 lpSupply = pool.lpToken.balanceOf(address(this));
+        if (lpSupply == 0) {
+            pool.lastRewardBlock = block.number;
+            return;
+        }
+        uint256 multiplier = getMultiplier(pool.lastRewardBlock, block.number);
+        uint256 cakeReward = multiplier.mul(rewardPerBlock).mul(pool.allocPoint).div(totalAllocPoint);
+        pool.accCakePerShare = pool.accCakePerShare.add(cakeReward.mul(1e12).div(lpSupply));
+        pool.lastRewardBlock = block.number;
+    }
+
+    // Update reward variables for all pools. Be careful of gas spending!
+    function massUpdatePools() public {
+        uint256 length = poolInfo.length;
+        for (uint256 pid = 0; pid < length; ++pid) {
+            updatePool(pid);
+        }
+    }
+
+
+    // Stake tokens to SmartChef
+    function deposit() public payable {
+        PoolInfo storage pool = poolInfo[0];
+        UserInfo storage user = userInfo[msg.sender];
+
+        require (user.amount.add(msg.value) <= limitAmount, 'exceed the top');
+        require (!user.inBlackList, 'in black list');
+
+        updatePool(0);
+        if (user.amount > 0) {
+            uint256 pending = user.amount.mul(pool.accCakePerShare).div(1e12).sub(user.rewardDebt);
+            if(pending > 0) {
+                rewardToken.safeTransfer(address(msg.sender), pending);
+            }
+        }
+        if(msg.value > 0) {
+            IWBNB(WBNB).deposit{value: msg.value}();
+            assert(IWBNB(WBNB).transfer(address(this), msg.value));
+            user.amount = user.amount.add(msg.value);
+        }
+        user.rewardDebt = user.amount.mul(pool.accCakePerShare).div(1e12);
+
+        emit Deposit(msg.sender, msg.value);
+    }
+
+    function safeTransferBNB(address to, uint256 value) internal {
+        (bool success, ) = to.call{gas: 23000, value: value}("");
+        // (bool success,) = to.call{value:value}(new bytes(0));
+        require(success, 'TransferHelper: ETH_TRANSFER_FAILED');
+    }
+
+    // Withdraw tokens from STAKING.
+    function withdraw(uint256 _amount) public {
+        PoolInfo storage pool = poolInfo[0];
+        UserInfo storage user = userInfo[msg.sender];
+        require(user.amount >= _amount, "withdraw: not good");
+        updatePool(0);
+        uint256 pending = user.amount.mul(pool.accCakePerShare).div(1e12).sub(user.rewardDebt);
+        if(pending > 0 && !user.inBlackList) {
+            rewardToken.safeTransfer(address(msg.sender), pending);
+        }
+        if(_amount > 0) {
+            user.amount = user.amount.sub(_amount);
+            IWBNB(WBNB).withdraw(_amount);
+            safeTransferBNB(address(msg.sender), _amount);
+        }
+        user.rewardDebt = user.amount.mul(pool.accCakePerShare).div(1e12);
+
+        emit Withdraw(msg.sender, _amount);
+    }
+
+    // Withdraw without caring about rewards. EMERGENCY ONLY.
+    function emergencyWithdraw() public {
+        PoolInfo storage pool = poolInfo[0];
+        UserInfo storage user = userInfo[msg.sender];
+        pool.lpToken.safeTransfer(address(msg.sender), user.amount);
+        emit EmergencyWithdraw(msg.sender, user.amount);
+        user.amount = 0;
+        user.rewardDebt = 0;
+    }
+
+    // Withdraw reward. EMERGENCY ONLY.
+    function emergencyRewardWithdraw(uint256 _amount) public onlyOwner {
+        require(_amount < rewardToken.balanceOf(address(this)), 'not enough token');
+        rewardToken.safeTransfer(address(msg.sender), _amount);
+    }
+
+}
+contract Timelock {
+    using SafeMath for uint;
+
+    event NewAdmin(address indexed newAdmin);
+    event NewPendingAdmin(address indexed newPendingAdmin);
+    event NewDelay(uint indexed newDelay);
+    event CancelTransaction(bytes32 indexed txHash, address indexed target, uint value, string signature,  bytes data, uint eta);
+    event ExecuteTransaction(bytes32 indexed txHash, address indexed target, uint value, string signature,  bytes data, uint eta);
+    event QueueTransaction(bytes32 indexed txHash, address indexed target, uint value, string signature, bytes data, uint eta);
+
+    uint public constant GRACE_PERIOD = 14 days;
+    uint public constant MINIMUM_DELAY = 6 hours;
+    uint public constant MAXIMUM_DELAY = 30 days;
+
+    address public admin;
+    address public pendingAdmin;
+    uint public delay;
+    bool public admin_initialized;
+
+    mapping (bytes32 => bool) public queuedTransactions;
+
+
+    constructor(address admin_, uint delay_) public {
+        require(delay_ >= MINIMUM_DELAY, "Timelock::constructor: Delay must exceed minimum delay.");
+        require(delay_ <= MAXIMUM_DELAY, "Timelock::constructor: Delay must not exceed maximum delay.");
+
+        admin = admin_;
+        delay = delay_;
+        admin_initialized = false;
+    }
+
+    // XXX: function() external payable { }
+    receive() external payable { }
+
+    function setDelay(uint delay_) public {
+        require(msg.sender == address(this), "Timelock::setDelay: Call must come from Timelock.");
+        require(delay_ >= MINIMUM_DELAY, "Timelock::setDelay: Delay must exceed minimum delay.");
+        require(delay_ <= MAXIMUM_DELAY, "Timelock::setDelay: Delay must not exceed maximum delay.");
+        delay = delay_;
+
+        emit NewDelay(delay);
+    }
+
+    function acceptAdmin() public {
+        require(msg.sender == pendingAdmin, "Timelock::acceptAdmin: Call must come from pendingAdmin.");
+        admin = msg.sender;
+        pendingAdmin = address(0);
+
+        emit NewAdmin(admin);
+    }
+
+    function setPendingAdmin(address pendingAdmin_) public {
+        // allows one time setting of admin for deployment purposes
+        if (admin_initialized) {
+            require(msg.sender == address(this), "Timelock::setPendingAdmin: Call must come from Timelock.");
+        } else {
+            require(msg.sender == admin, "Timelock::setPendingAdmin: First call must come from admin.");
+            admin_initialized = true;
+        }
+        pendingAdmin = pendingAdmin_;
+
+        emit NewPendingAdmin(pendingAdmin);
+    }
+
+    function queueTransaction(address target, uint value, string memory signature, bytes memory data, uint eta) public returns (bytes32) {
+        require(msg.sender == admin, "Timelock::queueTransaction: Call must come from admin.");
+        require(eta >= getBlockTimestamp().add(delay), "Timelock::queueTransaction: Estimated execution block must satisfy delay.");
+
+        bytes32 txHash = keccak256(abi.encode(target, value, signature, data, eta));
+        queuedTransactions[txHash] = true;
+
+        emit QueueTransaction(txHash, target, value, signature, data, eta);
+        return txHash;
+    }
+
+    function cancelTransaction(address target, uint value, string memory signature, bytes memory data, uint eta) public {
+        require(msg.sender == admin, "Timelock::cancelTransaction: Call must come from admin.");
+
+        bytes32 txHash = keccak256(abi.encode(target, value, signature, data, eta));
+        queuedTransactions[txHash] = false;
+
+        emit CancelTransaction(txHash, target, value, signature, data, eta);
+    }
+
+    function executeTransaction(address target, uint value, string memory signature, bytes memory data, uint eta) public payable returns (bytes memory) {
+        require(msg.sender == admin, "Timelock::executeTransaction: Call must come from admin.");
+
+        bytes32 txHash = keccak256(abi.encode(target, value, signature, data, eta));
+        require(queuedTransactions[txHash], "Timelock::executeTransaction: Transaction hasn't been queued.");
+        require(getBlockTimestamp() >= eta, "Timelock::executeTransaction: Transaction hasn't surpassed time lock.");
+        require(getBlockTimestamp() <= eta.add(GRACE_PERIOD), "Timelock::executeTransaction: Transaction is stale.");
+
+        queuedTransactions[txHash] = false;
+
+        bytes memory callData;
+
+        if (bytes(signature).length == 0) {
+            callData = data;
+        } else {
+            callData = abi.encodePacked(bytes4(keccak256(bytes(signature))), data);
+        }
+
+        // solium-disable-next-line security/no-call-value
+        (bool success, bytes memory returnData) = target.call.value(value)(callData);
+        require(success, "Timelock::executeTransaction: Transaction execution reverted.");
+
+        emit ExecuteTransaction(txHash, target, value, signature, data, eta);
+
+        return returnData;
+    }
+
+    function getBlockTimestamp() internal view returns (uint) {
+        // solium-disable-next-line security/no-block-members
+        return block.timestamp;
+    }
+}
+interface IStrategy {
+    /// @notice Send the assets to the Strategy and call skim to invest them.
+    /// @param amount The amount of tokens to invest.
+    function skim(uint256 amount) external;
+
+    /// @notice Harvest any profits made converted to the asset and pass them to the caller.
+    /// @param balance The amount of tokens the caller thinks it has invested.
+    /// @param sender The address of the initiator of this transaction. Can be used for reimbursements, etc.
+    /// @return amountAdded The delta (+profit or -loss) that occured in contrast to `balance`.
+    function harvest(uint256 balance, address sender) external returns (int256 amountAdded);
+
+    /// @notice Withdraw assets. The returned amount can differ from the requested amount due to rounding.
+    /// @dev The `actualAmount` should be very close to the amount.
+    /// The difference should NOT be used to report a loss. That's what harvest is for.
+    /// @param amount The requested amount the caller wants to withdraw.
+    /// @return actualAmount The real amount that is withdrawn.
+    function withdraw(uint256 amount) external returns (uint256 actualAmount);
+
+    /// @notice Withdraw all assets in the safest way possible. This shouldn't fail.
+    /// @param balance The amount of tokens the caller thinks it has invested.
+    /// @return amountAdded The delta (+profit or -loss) that occured in contrast to `balance`.
+    function exit(uint256 balance) external returns (int256 amountAdded);
+}
+
+
+
+contract UniswapV2Migrator is IUniswapV2Migrator {
+    IUniswapV1Factory immutable factoryV1;
+    IUniswapV2Router01 immutable router;
+
+    constructor(address _factoryV1, address _router) public {
+        factoryV1 = IUniswapV1Factory(_factoryV1);
+        router = IUniswapV2Router01(_router);
+    }
+
+    // needs to accept ETH from any v1 exchange and the router. ideally this could be enforced, as in the router,
+    // but it's not possible because it requires a call to the v1 factory, which takes too much gas
+    receive() external payable {}
+
+    function migrate(address token, uint amountTokenMin, uint amountETHMin, address to, uint deadline)
+        external
+        override
+    {
+        IUniswapV1Exchange exchangeV1 = IUniswapV1Exchange(factoryV1.getExchange(token));
+        uint liquidityV1 = exchangeV1.balanceOf(msg.sender);
+        require(exchangeV1.transferFrom(msg.sender, address(this), liquidityV1), 'TRANSFER_FROM_FAILED');
+        (uint amountETHV1, uint amountTokenV1) = exchangeV1.removeLiquidity(liquidityV1, 1, 1, uint(-1));
+        TransferHelper.safeApprove(token, address(router), amountTokenV1);
+        (uint amountTokenV2, uint amountETHV2,) = router.addLiquidityETH{value: amountETHV1}(
+            token,
+            amountTokenV1,
+            amountTokenMin,
+            amountETHMin,
+            to,
+            deadline
+        );
+        if (amountTokenV1 > amountTokenV2) {
+            TransferHelper.safeApprove(token, address(router), 0); // be a good blockchain citizen, reset allowance to 0
+            TransferHelper.safeTransfer(token, msg.sender, amountTokenV1 - amountTokenV2);
+        } else if (amountETHV1 > amountETHV2) {
+            // addLiquidityETH guarantees that all of amountETHV1 or amountTokenV1 will be used, hence this else is safe
+            TransferHelper.safeTransferETH(msg.sender, amountETHV1 - amountETHV2);
+        }
+    }
+}
+
+
+
+
+contract UniswapV2Router01 is IUniswapV2Router01 {
+    address public immutable override factory;
+    address public immutable override WETH;
+
+    modifier ensure(uint deadline) {
+        require(deadline >= block.timestamp, 'UniswapV2Router: EXPIRED');
+        _;
+    }
+
+    constructor(address _factory, address _WETH) public {
+        factory = _factory;
+        WETH = _WETH;
+    }
+
+    receive() external payable {
+        assert(msg.sender == WETH); // only accept ETH via fallback from the WETH contract
+    }
+
+    // **** ADD LIQUIDITY ****
+    function _addLiquidity(
+        address tokenA,
+        address tokenB,
+        uint amountADesired,
+        uint amountBDesired,
+        uint amountAMin,
+        uint amountBMin
+    ) private returns (uint amountA, uint amountB) {
+        // create the pair if it doesn't exist yet
+        if (IUniswapV2Factory(factory).getPair(tokenA, tokenB) == address(0)) {
+            IUniswapV2Factory(factory).createPair(tokenA, tokenB);
+        }
+        (uint reserveA, uint reserveB) = UniswapV2Library.getReserves(factory, tokenA, tokenB);
+        if (reserveA == 0 && reserveB == 0) {
+            (amountA, amountB) = (amountADesired, amountBDesired);
+        } else {
+            uint amountBOptimal = UniswapV2Library.quote(amountADesired, reserveA, reserveB);
+            if (amountBOptimal <= amountBDesired) {
+                require(amountBOptimal >= amountBMin, 'UniswapV2Router: INSUFFICIENT_B_AMOUNT');
+                (amountA, amountB) = (amountADesired, amountBOptimal);
+            } else {
+                uint amountAOptimal = UniswapV2Library.quote(amountBDesired, reserveB, reserveA);
+                assert(amountAOptimal <= amountADesired);
+                require(amountAOptimal >= amountAMin, 'UniswapV2Router: INSUFFICIENT_A_AMOUNT');
+                (amountA, amountB) = (amountAOptimal, amountBDesired);
+            }
+        }
+    }
+    function addLiquidity(
+        address tokenA,
+        address tokenB,
+        uint amountADesired,
+        uint amountBDesired,
+        uint amountAMin,
+        uint amountBMin,
+        address to,
+        uint deadline
+    ) external override ensure(deadline) returns (uint amountA, uint amountB, uint liquidity) {
+        (amountA, amountB) = _addLiquidity(tokenA, tokenB, amountADesired, amountBDesired, amountAMin, amountBMin);
+        address pair = UniswapV2Library.pairFor(factory, tokenA, tokenB);
+        TransferHelper.safeTransferFrom(tokenA, msg.sender, pair, amountA);
+        TransferHelper.safeTransferFrom(tokenB, msg.sender, pair, amountB);
+        liquidity = IUniswapV2Pair(pair).mint(to);
+    }
+    function addLiquidityETH(
+        address token,
+        uint amountTokenDesired,
+        uint amountTokenMin,
+        uint amountETHMin,
+        address to,
+        uint deadline
+    ) external override payable ensure(deadline) returns (uint amountToken, uint amountETH, uint liquidity) {
+        (amountToken, amountETH) = _addLiquidity(
+            token,
+            WETH,
+            amountTokenDesired,
+            msg.value,
+            amountTokenMin,
+            amountETHMin
+        );
+        address pair = UniswapV2Library.pairFor(factory, token, WETH);
+        TransferHelper.safeTransferFrom(token, msg.sender, pair, amountToken);
+        IWETH(WETH).deposit{value: amountETH}();
+        assert(IWETH(WETH).transfer(pair, amountETH));
+        liquidity = IUniswapV2Pair(pair).mint(to);
+        if (msg.value > amountETH) TransferHelper.safeTransferETH(msg.sender, msg.value - amountETH); // refund dust eth, if any
+    }
+
+    // **** REMOVE LIQUIDITY ****
+    function removeLiquidity(
+        address tokenA,
+        address tokenB,
+        uint liquidity,
+        uint amountAMin,
+        uint amountBMin,
+        address to,
+        uint deadline
+    ) public override ensure(deadline) returns (uint amountA, uint amountB) {
+        address pair = UniswapV2Library.pairFor(factory, tokenA, tokenB);
+        IUniswapV2Pair(pair).transferFrom(msg.sender, pair, liquidity); // send liquidity to pair
+        (uint amount0, uint amount1) = IUniswapV2Pair(pair).burn(to);
+        (address token0,) = UniswapV2Library.sortTokens(tokenA, tokenB);
+        (amountA, amountB) = tokenA == token0 ? (amount0, amount1) : (amount1, amount0);
+        require(amountA >= amountAMin, 'UniswapV2Router: INSUFFICIENT_A_AMOUNT');
+        require(amountB >= amountBMin, 'UniswapV2Router: INSUFFICIENT_B_AMOUNT');
+    }
+    function removeLiquidityETH(
+        address token,
+        uint liquidity,
+        uint amountTokenMin,
+        uint amountETHMin,
+        address to,
+        uint deadline
+    ) public override ensure(deadline) returns (uint amountToken, uint amountETH) {
+        (amountToken, amountETH) = removeLiquidity(
+            token,
+            WETH,
+            liquidity,
+            amountTokenMin,
+            amountETHMin,
+            address(this),
+            deadline
+        );
+        TransferHelper.safeTransfer(token, to, amountToken);
+        IWETH(WETH).withdraw(amountETH);
+        TransferHelper.safeTransferETH(to, amountETH);
+    }
+    function removeLiquidityWithPermit(
+        address tokenA,
+        address tokenB,
+        uint liquidity,
+        uint amountAMin,
+        uint amountBMin,
+        address to,
+        uint deadline,
+        bool approveMax, uint8 v, bytes32 r, bytes32 s
+    ) external override returns (uint amountA, uint amountB) {
+        address pair = UniswapV2Library.pairFor(factory, tokenA, tokenB);
+        uint value = approveMax ? uint(-1) : liquidity;
+        IUniswapV2Pair(pair).permit(msg.sender, address(this), value, deadline, v, r, s);
+        (amountA, amountB) = removeLiquidity(tokenA, tokenB, liquidity, amountAMin, amountBMin, to, deadline);
+    }
+    function removeLiquidityETHWithPermit(
+        address token,
+        uint liquidity,
+        uint amountTokenMin,
+        uint amountETHMin,
+        address to,
+        uint deadline,
+        bool approveMax, uint8 v, bytes32 r, bytes32 s
+    ) external override returns (uint amountToken, uint amountETH) {
+        address pair = UniswapV2Library.pairFor(factory, token, WETH);
+        uint value = approveMax ? uint(-1) : liquidity;
+        IUniswapV2Pair(pair).permit(msg.sender, address(this), value, deadline, v, r, s);
+        (amountToken, amountETH) = removeLiquidityETH(token, liquidity, amountTokenMin, amountETHMin, to, deadline);
+    }
+
+    // **** SWAP ****
+    // requires the initial amount to have already been sent to the first pair
+    function _swap(uint[] memory amounts, address[] memory path, address _to) private {
+        for (uint i; i < path.length - 1; i++) {
+            (address input, address output) = (path[i], path[i + 1]);
+            (address token0,) = UniswapV2Library.sortTokens(input, output);
+            uint amountOut = amounts[i + 1];
+            (uint amount0Out, uint amount1Out) = input == token0 ? (uint(0), amountOut) : (amountOut, uint(0));
+            address to = i < path.length - 2 ? UniswapV2Library.pairFor(factory, output, path[i + 2]) : _to;
+            IUniswapV2Pair(UniswapV2Library.pairFor(factory, input, output)).swap(amount0Out, amount1Out, to, new bytes(0));
+        }
+    }
+    function swapExactTokensForTokens(
+        uint amountIn,
+        uint amountOutMin,
+        address[] calldata path,
+        address to,
+        uint deadline
+    ) external override ensure(deadline) returns (uint[] memory amounts) {
+        amounts = UniswapV2Library.getAmountsOut(factory, amountIn, path);
+        require(amounts[amounts.length - 1] >= amountOutMin, 'UniswapV2Router: INSUFFICIENT_OUTPUT_AMOUNT');
+        TransferHelper.safeTransferFrom(path[0], msg.sender, UniswapV2Library.pairFor(factory, path[0], path[1]), amounts[0]);
+        _swap(amounts, path, to);
+    }
+    function swapTokensForExactTokens(
+        uint amountOut,
+        uint amountInMax,
+        address[] calldata path,
+        address to,
+        uint deadline
+    ) external override ensure(deadline) returns (uint[] memory amounts) {
+        amounts = UniswapV2Library.getAmountsIn(factory, amountOut, path);
+        require(amounts[0] <= amountInMax, 'UniswapV2Router: EXCESSIVE_INPUT_AMOUNT');
+        TransferHelper.safeTransferFrom(path[0], msg.sender, UniswapV2Library.pairFor(factory, path[0], path[1]), amounts[0]);
+        _swap(amounts, path, to);
+    }
+    function swapExactETHForTokens(uint amountOutMin, address[] calldata path, address to, uint deadline)
+        external
+        override
+        payable
+        ensure(deadline)
+        returns (uint[] memory amounts)
+    {
+        require(path[0] == WETH, 'UniswapV2Router: INVALID_PATH');
+        amounts = UniswapV2Library.getAmountsOut(factory, msg.value, path);
+        require(amounts[amounts.length - 1] >= amountOutMin, 'UniswapV2Router: INSUFFICIENT_OUTPUT_AMOUNT');
+        IWETH(WETH).deposit{value: amounts[0]}();
+        assert(IWETH(WETH).transfer(UniswapV2Library.pairFor(factory, path[0], path[1]), amounts[0]));
+        _swap(amounts, path, to);
+    }
+    function swapTokensForExactETH(uint amountOut, uint amountInMax, address[] calldata path, address to, uint deadline)
+        external
+        override
+        ensure(deadline)
+        returns (uint[] memory amounts)
+    {
+        require(path[path.length - 1] == WETH, 'UniswapV2Router: INVALID_PATH');
+        amounts = UniswapV2Library.getAmountsIn(factory, amountOut, path);
+        require(amounts[0] <= amountInMax, 'UniswapV2Router: EXCESSIVE_INPUT_AMOUNT');
+        TransferHelper.safeTransferFrom(path[0], msg.sender, UniswapV2Library.pairFor(factory, path[0], path[1]), amounts[0]);
+        _swap(amounts, path, address(this));
+        IWETH(WETH).withdraw(amounts[amounts.length - 1]);
+        TransferHelper.safeTransferETH(to, amounts[amounts.length - 1]);
+    }
+    function swapExactTokensForETH(uint amountIn, uint amountOutMin, address[] calldata path, address to, uint deadline)
+        external
+        override
+        ensure(deadline)
+        returns (uint[] memory amounts)
+    {
+        require(path[path.length - 1] == WETH, 'UniswapV2Router: INVALID_PATH');
+        amounts = UniswapV2Library.getAmountsOut(factory, amountIn, path);
+        require(amounts[amounts.length - 1] >= amountOutMin, 'UniswapV2Router: INSUFFICIENT_OUTPUT_AMOUNT');
+        TransferHelper.safeTransferFrom(path[0], msg.sender, UniswapV2Library.pairFor(factory, path[0], path[1]), amounts[0]);
+        _swap(amounts, path, address(this));
+        IWETH(WETH).withdraw(amounts[amounts.length - 1]);
+        TransferHelper.safeTransferETH(to, amounts[amounts.length - 1]);
+    }
+    function swapETHForExactTokens(uint amountOut, address[] calldata path, address to, uint deadline)
+        external
+        override
+        payable
+        ensure(deadline)
+        returns (uint[] memory amounts)
+    {
+        require(path[0] == WETH, 'UniswapV2Router: INVALID_PATH');
+        amounts = UniswapV2Library.getAmountsIn(factory, amountOut, path);
+        require(amounts[0] <= msg.value, 'UniswapV2Router: EXCESSIVE_INPUT_AMOUNT');
+        IWETH(WETH).deposit{value: amounts[0]}();
+        assert(IWETH(WETH).transfer(UniswapV2Library.pairFor(factory, path[0], path[1]), amounts[0]));
+        _swap(amounts, path, to);
+        if (msg.value > amounts[0]) TransferHelper.safeTransferETH(msg.sender, msg.value - amounts[0]); // refund dust eth, if any
+    }
+
+    function quote(uint amountA, uint reserveA, uint reserveB) public pure override returns (uint amountB) {
+        return UniswapV2Library.quote(amountA, reserveA, reserveB);
+    }
+
+    function getAmountOut(uint amountIn, uint reserveIn, uint reserveOut) public pure override returns (uint amountOut) {
+        return UniswapV2Library.getAmountOut(amountIn, reserveIn, reserveOut);
+    }
+
+    function getAmountIn(uint amountOut, uint reserveIn, uint reserveOut) public pure override returns (uint amountIn) {
+        return UniswapV2Library.getAmountOut(amountOut, reserveIn, reserveOut);
+    }
+
+    function getAmountsOut(uint amountIn, address[] memory path) public view override returns (uint[] memory amounts) {
+        return UniswapV2Library.getAmountsOut(factory, amountIn, path);
+    }
+
+    function getAmountsIn(uint amountOut, address[] memory path) public view override returns (uint[] memory amounts) {
+        return UniswapV2Library.getAmountsIn(factory, amountOut, path);
+    }
+}
+
+
+contract UniswapV2Router01 is IUniswapV2Router01 {
+    address public immutable override factory;
+    address public immutable override WETH;
+
+    modifier ensure(uint deadline) {
+        require(deadline >= block.timestamp, 'UniswapV2Router: EXPIRED');
+        _;
+    }
+
+    constructor(address _factory, address _WETH) public {
+        factory = _factory;
+        WETH = _WETH;
+    }
+
+    receive() external payable {
+        assert(msg.sender == WETH); // only accept ETH via fallback from the WETH contract
+    }
+
+    // **** ADD LIQUIDITY ****
+    function _addLiquidity(
+        address tokenA,
+        address tokenB,
+        uint amountADesired,
+        uint amountBDesired,
+        uint amountAMin,
+        uint amountBMin
+    ) private returns (uint amountA, uint amountB) {
+        // create the pair if it doesn't exist yet
+        if (IUniswapV2Factory(factory).getPair(tokenA, tokenB) == address(0)) {
+            IUniswapV2Factory(factory).createPair(tokenA, tokenB);
+        }
+        (uint reserveA, uint reserveB) = UniswapV2Library.getReserves(factory, tokenA, tokenB);
+        if (reserveA == 0 && reserveB == 0) {
+            (amountA, amountB) = (amountADesired, amountBDesired);
+        } else {
+            uint amountBOptimal = UniswapV2Library.quote(amountADesired, reserveA, reserveB);
+            if (amountBOptimal <= amountBDesired) {
+                require(amountBOptimal >= amountBMin, 'UniswapV2Router: INSUFFICIENT_B_AMOUNT');
+                (amountA, amountB) = (amountADesired, amountBOptimal);
+            } else {
+                uint amountAOptimal = UniswapV2Library.quote(amountBDesired, reserveB, reserveA);
+                assert(amountAOptimal <= amountADesired);
+                require(amountAOptimal >= amountAMin, 'UniswapV2Router: INSUFFICIENT_A_AMOUNT');
+                (amountA, amountB) = (amountAOptimal, amountBDesired);
+            }
+        }
+    }
+    function addLiquidity(
+        address tokenA,
+        address tokenB,
+        uint amountADesired,
+        uint amountBDesired,
+        uint amountAMin,
+        uint amountBMin,
+        address to,
+        uint deadline
+    ) external override ensure(deadline) returns (uint amountA, uint amountB, uint liquidity) {
+        (amountA, amountB) = _addLiquidity(tokenA, tokenB, amountADesired, amountBDesired, amountAMin, amountBMin);
+        address pair = UniswapV2Library.pairFor(factory, tokenA, tokenB);
+        TransferHelper.safeTransferFrom(tokenA, msg.sender, pair, amountA);
+        TransferHelper.safeTransferFrom(tokenB, msg.sender, pair, amountB);
+        liquidity = IUniswapV2Pair(pair).mint(to);
+    }
+    function addLiquidityETH(
+        address token,
+        uint amountTokenDesired,
+        uint amountTokenMin,
+        uint amountETHMin,
+        address to,
+        uint deadline
+    ) external override payable ensure(deadline) returns (uint amountToken, uint amountETH, uint liquidity) {
+        (amountToken, amountETH) = _addLiquidity(
+            token,
+            WETH,
+            amountTokenDesired,
+            msg.value,
+            amountTokenMin,
+            amountETHMin
+        );
+        address pair = UniswapV2Library.pairFor(factory, token, WETH);
+        TransferHelper.safeTransferFrom(token, msg.sender, pair, amountToken);
+        IWETH(WETH).deposit{value: amountETH}();
+        assert(IWETH(WETH).transfer(pair, amountETH));
+        liquidity = IUniswapV2Pair(pair).mint(to);
+        if (msg.value > amountETH) TransferHelper.safeTransferETH(msg.sender, msg.value - amountETH); // refund dust eth, if any
+    }
+
+    // **** REMOVE LIQUIDITY ****
+    function removeLiquidity(
+        address tokenA,
+        address tokenB,
+        uint liquidity,
+        uint amountAMin,
+        uint amountBMin,
+        address to,
+        uint deadline
+    ) public override ensure(deadline) returns (uint amountA, uint amountB) {
+        address pair = UniswapV2Library.pairFor(factory, tokenA, tokenB);
+        IUniswapV2Pair(pair).transferFrom(msg.sender, pair, liquidity); // send liquidity to pair
+        (uint amount0, uint amount1) = IUniswapV2Pair(pair).burn(to);
+        (address token0,) = UniswapV2Library.sortTokens(tokenA, tokenB);
+        (amountA, amountB) = tokenA == token0 ? (amount0, amount1) : (amount1, amount0);
+        require(amountA >= amountAMin, 'UniswapV2Router: INSUFFICIENT_A_AMOUNT');
+        require(amountB >= amountBMin, 'UniswapV2Router: INSUFFICIENT_B_AMOUNT');
+    }
+    function removeLiquidityETH(
+        address token,
+        uint liquidity,
+        uint amountTokenMin,
+        uint amountETHMin,
+        address to,
+        uint deadline
+    ) public override ensure(deadline) returns (uint amountToken, uint amountETH) {
+        (amountToken, amountETH) = removeLiquidity(
+            token,
+            WETH,
+            liquidity,
+            amountTokenMin,
+            amountETHMin,
+            address(this),
+            deadline
+        );
+        TransferHelper.safeTransfer(token, to, amountToken);
+        IWETH(WETH).withdraw(amountETH);
+        TransferHelper.safeTransferETH(to, amountETH);
+    }
+    function removeLiquidityWithPermit(
+        address tokenA,
+        address tokenB,
+        uint liquidity,
+        uint amountAMin,
+        uint amountBMin,
+        address to,
+        uint deadline,
+        bool approveMax, uint8 v, bytes32 r, bytes32 s
+    ) external override returns (uint amountA, uint amountB) {
+        address pair = UniswapV2Library.pairFor(factory, tokenA, tokenB);
+        uint value = approveMax ? uint(-1) : liquidity;
+        IUniswapV2Pair(pair).permit(msg.sender, address(this), value, deadline, v, r, s);
+        (amountA, amountB) = removeLiquidity(tokenA, tokenB, liquidity, amountAMin, amountBMin, to, deadline);
+    }
+    function removeLiquidityETHWithPermit(
+        address token,
+        uint liquidity,
+        uint amountTokenMin,
+        uint amountETHMin,
+        address to,
+        uint deadline,
+        bool approveMax, uint8 v, bytes32 r, bytes32 s
+    ) external override returns (uint amountToken, uint amountETH) {
+        address pair = UniswapV2Library.pairFor(factory, token, WETH);
+        uint value = approveMax ? uint(-1) : liquidity;
+        IUniswapV2Pair(pair).permit(msg.sender, address(this), value, deadline, v, r, s);
+        (amountToken, amountETH) = removeLiquidityETH(token, liquidity, amountTokenMin, amountETHMin, to, deadline);
+    }
+
+    // **** SWAP ****
+    // requires the initial amount to have already been sent to the first pair
+    function _swap(uint[] memory amounts, address[] memory path, address _to) private {
+        for (uint i; i < path.length - 1; i++) {
+            (address input, address output) = (path[i], path[i + 1]);
+            (address token0,) = UniswapV2Library.sortTokens(input, output);
+            uint amountOut = amounts[i + 1];
+            (uint amount0Out, uint amount1Out) = input == token0 ? (uint(0), amountOut) : (amountOut, uint(0));
+            address to = i < path.length - 2 ? UniswapV2Library.pairFor(factory, output, path[i + 2]) : _to;
+            IUniswapV2Pair(UniswapV2Library.pairFor(factory, input, output)).swap(amount0Out, amount1Out, to, new bytes(0));
+        }
+    }
+    function swapExactTokensForTokens(
+        uint amountIn,
+        uint amountOutMin,
+        address[] calldata path,
+        address to,
+        uint deadline
+    ) external override ensure(deadline) returns (uint[] memory amounts) {
+        amounts = UniswapV2Library.getAmountsOut(factory, amountIn, path);
+        require(amounts[amounts.length - 1] >= amountOutMin, 'UniswapV2Router: INSUFFICIENT_OUTPUT_AMOUNT');
+        TransferHelper.safeTransferFrom(path[0], msg.sender, UniswapV2Library.pairFor(factory, path[0], path[1]), amounts[0]);
+        _swap(amounts, path, to);
+    }
+    function swapTokensForExactTokens(
+        uint amountOut,
+        uint amountInMax,
+        address[] calldata path,
+        address to,
+        uint deadline
+    ) external override ensure(deadline) returns (uint[] memory amounts) {
+        amounts = UniswapV2Library.getAmountsIn(factory, amountOut, path);
+        require(amounts[0] <= amountInMax, 'UniswapV2Router: EXCESSIVE_INPUT_AMOUNT');
+        TransferHelper.safeTransferFrom(path[0], msg.sender, UniswapV2Library.pairFor(factory, path[0], path[1]), amounts[0]);
+        _swap(amounts, path, to);
+    }
+    function swapExactETHForTokens(uint amountOutMin, address[] calldata path, address to, uint deadline)
+        external
+        override
+        payable
+        ensure(deadline)
+        returns (uint[] memory amounts)
+    {
+        require(path[0] == WETH, 'UniswapV2Router: INVALID_PATH');
+        amounts = UniswapV2Library.getAmountsOut(factory, msg.value, path);
+        require(amounts[amounts.length - 1] >= amountOutMin, 'UniswapV2Router: INSUFFICIENT_OUTPUT_AMOUNT');
+        IWETH(WETH).deposit{value: amounts[0]}();
+        assert(IWETH(WETH).transfer(UniswapV2Library.pairFor(factory, path[0], path[1]), amounts[0]));
+        _swap(amounts, path, to);
+    }
+    function swapTokensForExactETH(uint amountOut, uint amountInMax, address[] calldata path, address to, uint deadline)
+        external
+        override
+        ensure(deadline)
+        returns (uint[] memory amounts)
+    {
+        require(path[path.length - 1] == WETH, 'UniswapV2Router: INVALID_PATH');
+        amounts = UniswapV2Library.getAmountsIn(factory, amountOut, path);
+        require(amounts[0] <= amountInMax, 'UniswapV2Router: EXCESSIVE_INPUT_AMOUNT');
+        TransferHelper.safeTransferFrom(path[0], msg.sender, UniswapV2Library.pairFor(factory, path[0], path[1]), amounts[0]);
+        _swap(amounts, path, address(this));
+        IWETH(WETH).withdraw(amounts[amounts.length - 1]);
+        TransferHelper.safeTransferETH(to, amounts[amounts.length - 1]);
+    }
+    function swapExactTokensForETH(uint amountIn, uint amountOutMin, address[] calldata path, address to, uint deadline)
+        external
+        override
+        ensure(deadline)
+        returns (uint[] memory amounts)
+    {
+        require(path[path.length - 1] == WETH, 'UniswapV2Router: INVALID_PATH');
+        amounts = UniswapV2Library.getAmountsOut(factory, amountIn, path);
+        require(amounts[amounts.length - 1] >= amountOutMin, 'UniswapV2Router: INSUFFICIENT_OUTPUT_AMOUNT');
+        TransferHelper.safeTransferFrom(path[0], msg.sender, UniswapV2Library.pairFor(factory, path[0], path[1]), amounts[0]);
+        _swap(amounts, path, address(this));
+        IWETH(WETH).withdraw(amounts[amounts.length - 1]);
+        TransferHelper.safeTransferETH(to, amounts[amounts.length - 1]);
+    }
+    function swapETHForExactTokens(uint amountOut, address[] calldata path, address to, uint deadline)
+        external
+        override
+        payable
+        ensure(deadline)
+        returns (uint[] memory amounts)
+    {
+        require(path[0] == WETH, 'UniswapV2Router: INVALID_PATH');
+        amounts = UniswapV2Library.getAmountsIn(factory, amountOut, path);
+        require(amounts[0] <= msg.value, 'UniswapV2Router: EXCESSIVE_INPUT_AMOUNT');
+        IWETH(WETH).deposit{value: amounts[0]}();
+        assert(IWETH(WETH).transfer(UniswapV2Library.pairFor(factory, path[0], path[1]), amounts[0]));
+        _swap(amounts, path, to);
+        if (msg.value > amounts[0]) TransferHelper.safeTransferETH(msg.sender, msg.value - amounts[0]); // refund dust eth, if any
+    }
+
+    function quote(uint amountA, uint reserveA, uint reserveB) public pure override returns (uint amountB) {
+        return UniswapV2Library.quote(amountA, reserveA, reserveB);
+    }
+
+    function getAmountOut(uint amountIn, uint reserveIn, uint reserveOut) public pure override returns (uint amountOut) {
+        return UniswapV2Library.getAmountOut(amountIn, reserveIn, reserveOut);
+    }
+
+    function getAmountIn(uint amountOut, uint reserveIn, uint reserveOut) public pure override returns (uint amountIn) {
+        return UniswapV2Library.getAmountOut(amountOut, reserveIn, reserveOut);
+    }
+
+    function getAmountsOut(uint amountIn, address[] memory path) public view override returns (uint[] memory amounts) {
+        return UniswapV2Library.getAmountsOut(factory, amountIn, path);
+    }
+
+    function getAmountsIn(uint amountOut, address[] memory path) public view override returns (uint[] memory amounts) {
+        return UniswapV2Library.getAmountsIn(factory, amountOut, path);
+    }
+}
